@@ -2,7 +2,6 @@
 // `construct_runtime!` does a lot of recursion and requires us to increase the limit to 256.
 #![recursion_limit = "256"]
 
-// Make the WASM binary available.
 #[cfg(feature = "std")]
 include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 
@@ -39,20 +38,16 @@ pub use sp_runtime::BuildStorage;
 pub use sp_runtime::{MultiAddress, Perbill, Permill};
 
 // XCM Imports
-use pallet_xcm::XcmPassthrough;
+use pallet_xcm::{XcmPassthrough, EnsureXcm, IsMajorityOfBody};
 use polkadot_parachain::primitives::Sibling;
 use xcm::latest::prelude::*;
-use xcm_builder::{
-	AccountId32Aliases, AllowTopLevelPaidExecutionFrom, AllowUnpaidExecutionFrom, CurrencyAdapter,
-	EnsureXcmOrigin, FixedWeightBounds, IsConcrete, LocationInverter, NativeAsset, ParentIsDefault,
-	RelayChainAsNative, SiblingParachainAsNative, SiblingParachainConvertsVia,
-	SignedAccountId32AsNative, SignedToAccountId32, SovereignSignedViaLocation, TakeWeightCredit,
-	UsingComponents,
-};
+use xcm_builder::{AccountId32Aliases, AllowTopLevelPaidExecutionFrom, AllowUnpaidExecutionFrom, CurrencyAdapter, EnsureXcmOrigin, FixedWeightBounds, IsConcrete, LocationInverter, NativeAsset, ParentIsDefault, RelayChainAsNative, SiblingParachainAsNative, SiblingParachainConvertsVia, SignedAccountId32AsNative, SovereignSignedViaLocation, TakeWeightCredit, UsingComponents, FungiblesAdapter, ConvertedConcreteAssetId, AsPrefixedGeneralIndex};
 use xcm_executor::{Config, XcmExecutor};
 
 /// Import the template pallet.
 pub use template;
+use frame_system::{EnsureOneOf, EnsureRoot};
+use xcm_executor::traits::JustTry;
 
 /// Alias to 512-bit hash when used in the context of a transaction signature on the chain.
 pub type Signature = MultiSignature;
@@ -379,7 +374,7 @@ impl Config for XcmConfig {
 	type Call = Call;
 	type XcmSender = XcmRouter;
 	// How to withdraw and deposit an asset.
-	type AssetTransactor = LocalAssetTransactor;
+	type AssetTransactor = AssetTransactors;
 	type OriginConverter = XcmOriginToTransactDispatchOrigin;
 	type IsReserve = NativeAsset;
 	type IsTeleporter = (); // Teleporting is disabled.
@@ -444,6 +439,85 @@ impl template::Config for Runtime {
 	type Event = Event;
 }
 
+/// Means for transacting assets besides the native currency on this chain.
+pub type FungiblesTransactor = FungiblesAdapter<
+	// Use this fungibles implementation:
+	Assets,
+	// Use this currency when it is a fungible asset matching the given location or name:
+	ConvertedConcreteAssetId<
+		AssetId,
+		Balance,
+		AsPrefixedGeneralIndex<Local, AssetId, JustTry>,
+		JustTry,
+	>,
+	// Convert an XCM MultiLocation into a local account id:
+	LocationToAccountId,
+	// Our chain's account ID type (we can't get away without mentioning it explicitly):
+	AccountId,
+	// We do not support teleports so no need for obj implementing Contains check
+	(),
+	// The account to use for tracking teleports (Empty because we do not support teleports)
+	(),
+>;
+
+/// Means for transacting assets on this chain.
+pub type AssetTransactors = (LocalAssetTransactor, FungiblesTransactor);
+
+pub mod currency {
+	pub type Balance = u128;
+
+	/// The existential deposit. Set to 1/10 of its parent Relay Chain (v9010).
+	pub const EXISTENTIAL_DEPOSIT: Balance = 10 * CENTS;
+
+	pub const UNITS: Balance = 10_000_000_000;
+	pub const DOLLARS: Balance = UNITS;
+	pub const CENTS: Balance = UNITS / 100; // 100_000_000
+	pub const MILLICENTS: Balance = CENTS / 1_000; // 100_000
+
+	pub const fn deposit(items: u32, bytes: u32) -> Balance {
+		// 1/10 of Polkadot v9010
+		(items as Balance * 20 * DOLLARS + (bytes as Balance) * 100 * MILLICENTS) / 10
+	}
+}
+
+parameter_types! {
+	pub const DotLocation: MultiLocation = MultiLocation::parent();
+	pub const AssetDeposit: Balance = 100 * currency::DOLLARS; // 100 DOLLARS deposit to create asset
+	pub const ApprovalDeposit: Balance = currency::EXISTENTIAL_DEPOSIT;
+	pub const AssetsStringLimit: u32 = 50;
+	/// Key = 32 bytes, Value = 36 bytes (32+1+1+1+1)
+	// https://github.com/paritytech/substrate/blob/069917b/frame/assets/src/lib.rs#L257L271
+	pub const MetadataDepositBase: Balance = currency::deposit(1, 68);
+	pub const MetadataDepositPerByte: Balance = currency::deposit(0, 1);
+	pub const ExecutiveBody: BodyId = BodyId::Executive;
+	pub const Local: MultiLocation = Here.into();
+}
+
+/// We allow root and the Relay Chain council to execute privileged asset operations.
+pub type AssetsForceOrigin = EnsureOneOf<
+	AccountId,
+	EnsureRoot<AccountId>,
+	EnsureXcm<IsMajorityOfBody<DotLocation, ExecutiveBody>>,
+>;
+
+pub type AssetId = u32;
+
+impl pallet_assets::Config for Runtime {
+	type Event = Event;
+	type Balance = Balance;
+	type AssetId = AssetId;
+	type Currency = Balances;
+	type ForceOrigin = AssetsForceOrigin;
+	type AssetDeposit = AssetDeposit;
+	type MetadataDepositBase = MetadataDepositBase;
+	type MetadataDepositPerByte = MetadataDepositPerByte;
+	type ApprovalDeposit = ApprovalDeposit;
+	type StringLimit = AssetsStringLimit;
+	type Freezer = ();
+	type Extra = ();
+	type WeightInfo = pallet_assets::weights::SubstrateWeight<Runtime>;
+}
+
 // Create the runtime by composing the FRAME pallets that were previously configured.
 construct_runtime!(
 	pub enum Runtime where
@@ -473,7 +547,9 @@ construct_runtime!(
 		DmpQueue: cumulus_pallet_dmp_queue::{Pallet, Call, Storage, Event<T>} = 53,
 
 		//Template
-		TemplatePallet: template::{Pallet, Call, Storage, Event<T>},
+		TemplatePallet: template::{Pallet, Call, Storage, Event<T>} = 54,
+
+		Assets: pallet_assets::{Pallet, Call, Storage, Event<T>} = 55,
 	}
 );
 
